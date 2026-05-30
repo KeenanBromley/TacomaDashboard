@@ -1,228 +1,165 @@
 #!/usr/bin/env python3
-"""
-Raspberry Pi OBD-II Dashboard for 2011 Toyota Tacoma
-Displays real-time vehicle data and controls accessory lights via GPIO relays.
+"""Console dashboard for Raspberry Pi OS Lite.
 
-Features:
-  - Live gauges: speed, RPM, coolant temp, engine load, intake temp, instant & avg MPG
-  - Distance-to-empty gauge with persistent fuel state (saved every 30 seconds)
-  - Trip statistics (duration, distance, avg MPG) with reset
-  - Light switch panel (pod lights, amber bar, white bar)
-  - Day / night mode
+Shows live OBD-II data, trip statistics, fuel range, and relay controls in a
+terminal-only interface so the Pi can boot without a desktop environment.
 """
 
-import tkinter as tk
-from tkinter import font as tkfont
-import obd
-from obd import OBDStatus
-import RPi.GPIO as GPIO
-import threading
-import time
+from __future__ import annotations
+
+import curses
 import json
 import os
+import signal
+import threading
+import time
 from collections import deque
+from contextlib import suppress
 from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+import obd
+from obd import OBDStatus
 
-# GPIO pin assignments (BCM numbering) for active-LOW relay board
+try:
+    import RPi.GPIO as GPIO
+except Exception:  # pragma: no cover - keeps the file importable off-Pi
+    class _DummyGPIO:
+        BCM = OUT = HIGH = LOW = None
+
+        def setmode(self, *_args, **_kwargs):
+            pass
+
+        def setwarnings(self, *_args, **_kwargs):
+            pass
+
+        def setup(self, *_args, **_kwargs):
+            pass
+
+        def output(self, *_args, **_kwargs):
+            pass
+
+        def cleanup(self):
+            pass
+
+    GPIO = _DummyGPIO()
+
+
 RELAY_PINS = {
     'pod_lights': 17,
-    'amber_bar':  18,
-    'white_bar':  27,
+    'amber_bar': 18,
+    'white_bar': 27,
 }
 
-# Tire size correction factor applied to OBD speed readings
-#   Stock tires:   265/70R16 → 30.6" diameter
-#   Current tires: 285/70R17 → 32.7" diameter
-#   Factor = 32.7 / 30.6
+RELAY_LABELS = {
+    'pod_lights': 'Pod Lights',
+    'amber_bar': 'Amber Bar',
+    'white_bar': 'White Bar',
+}
+
 TIRE_CORRECTION_FACTOR = 1.0686
-
-# Fuel tank capacity in gallons (2011 Toyota Tacoma)
 TANK_CAPACITY_GALLONS = 21.0
-
-# Path for the persistent fuel/trip state file (same directory as this script)
 FUEL_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fuel_state.json')
-
-# How often (seconds) to write the fuel state to disk
 FUEL_SAVE_INTERVAL = 30
 
-# ---------------------------------------------------------------------------
-# Color palettes
-# ---------------------------------------------------------------------------
 
-COLORS = {
-    'day': {
-        'bg':            '#F0F0F0',
-        'text':          '#111111',
-        'gauge_bg':      '#FFFFFF',
-        'gauge_border':  '#CCCCCC',
-        'accent':        '#2196F3',
-        'button_bg':     '#E0E0E0',
-        'button_active': '#4CAF50',
-        'warning':       '#FF5722',
-        'dte_low':       '#FF5722',   # red when range is low
-        'dte_mid':       '#FF9800',   # orange when range is moderate
-        'dte_ok':        '#4CAF50',   # green when range is healthy
-    },
-    'night': {
-        'bg':            '#1A1A1A',
-        'text':          '#FFFFFF',
-        'gauge_bg':      '#2A2A2A',
-        'gauge_border':  '#404040',
-        'accent':        '#2196F3',
-        'button_bg':     '#333333',
-        'button_active': '#4CAF50',
-        'warning':       '#FF5722',
-        'dte_low':       '#FF5722',
-        'dte_mid':       '#FF9800',
-        'dte_ok':        '#4CAF50',
-    },
-}
+def _format_duration(total_seconds: int) -> str:
+    hours, remainder = divmod(max(0, total_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
-# ---------------------------------------------------------------------------
-# Main application class
-# ---------------------------------------------------------------------------
+class OBDDashboardConsole:
+    def __init__(self):
+        self.running = True
+        self.state_lock = threading.Lock()
 
-class OBDDashboard:
-
-    # -----------------------------------------------------------------------
-    # Initialisation
-    # -----------------------------------------------------------------------
-
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Tacoma Dashboard")
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(cursor='none')  # hide cursor for touchscreen use
-
-        # ── UI state ──────────────────────────────────────────────────────
-        self.night_mode      = False
+        self.night_mode = False
         self.show_trip_stats = False
 
-        # ── Hardware state ────────────────────────────────────────────────
-        self.connection   = None
-        self.relay_states = {key: False for key in RELAY_PINS}
-        self.running      = True
+        self.connection = None
+        self.connection_status = 'Connecting...'
+        self.last_connection_attempt = 0.0
 
-        # ── Live vehicle data ─────────────────────────────────────────────
+        self.relay_states = {key: False for key in RELAY_PINS}
+        self.gpio_available = True
+
         self.vehicle_data = {
-            'speed':        0.0,
-            'rpm':          0,
+            'speed': 0.0,
+            'rpm': 0,
             'coolant_temp': 0,
-            'engine_load':  0,
-            'intake_temp':  0,
-            'instant_mpg':  0.0,
-            'avg_mpg':      0.0,
+            'engine_load': 0,
+            'intake_temp': 0,
+            'instant_mpg': 0.0,
+            'avg_mpg': 0.0,
         }
 
-        # ── MPG history (all readings in current trip) ────────────────────
         self.mpg_history: deque[float] = deque()
+        self.trip_start_time = datetime.now()
+        self.trip_distance_mi = 0.0
+        self.last_obd_time = time.time()
 
-        # ── Trip statistics ───────────────────────────────────────────────
-        self.trip_start_time  = datetime.now()
-        self.trip_distance_mi = 0.0   # miles driven this trip
-        self.last_speed       = 0.0
-        self.last_obd_time    = time.time()
+        self.gas_used_gallons = 0.0
+        self.last_fuel_save = time.time()
 
-        # ── Fuel tracking (loaded from disk on startup) ───────────────────
-        self.gas_used_gallons  = 0.0   # cumulative gallons consumed
-        self.last_fuel_save    = time.time()
-
+        self.status_message = 'Starting dashboard...'
         self._load_fuel_state()
-
-        # ── Setup & launch ────────────────────────────────────────────────
         self._setup_gpio()
-        self._create_ui()
         self._connect_obd()
 
-        self.update_thread = threading.Thread(
-            target=self._obd_update_loop, daemon=True
-        )
+        self.update_thread = threading.Thread(target=self._obd_update_loop, daemon=True)
         self.update_thread.start()
 
-        # Escape exits (useful during development/testing)
-        self.root.bind('<Escape>', lambda _e: self._cleanup_and_exit())
-
-    # -----------------------------------------------------------------------
-    # GPIO
-    # -----------------------------------------------------------------------
-
     def _setup_gpio(self):
-        """Configure relay GPIO pins. Active-LOW board: HIGH = relay OFF."""
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        for pin in RELAY_PINS.values():
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.HIGH)
-
-    # -----------------------------------------------------------------------
-    # OBD connection
-    # -----------------------------------------------------------------------
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            for pin in RELAY_PINS.values():
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.HIGH)
+        except Exception as exc:
+            self.gpio_available = False
+            self.status_message = f'GPIO unavailable: {exc}'
 
     def _connect_obd(self):
-        """Attempt to connect to the OBD-II adapter."""
+        self.last_connection_attempt = time.time()
         try:
-            print("Connecting to OBD-II adapter…")
             self.connection = obd.OBD()
             status = self.connection.status()
             if status == OBDStatus.CAR_CONNECTED:
-                print("Connected to vehicle.")
+                self.connection_status = 'Vehicle connected'
+                self.status_message = 'OBD-II adapter connected.'
             else:
-                print(f"OBD adapter found but vehicle not detected (status={status}).")
+                self.connection_status = f'Adapter ready, vehicle not detected ({status})'
+                self.status_message = 'OBD-II adapter found, waiting for vehicle.'
         except Exception as exc:
-            print(f"OBD connection error: {exc}")
             self.connection = None
-
-    # -----------------------------------------------------------------------
-    # Fuel state persistence
-    # -----------------------------------------------------------------------
+            self.connection_status = 'OBD connection failed'
+            self.status_message = f'OBD connection error: {exc}'
 
     def _load_fuel_state(self):
-        """
-        Read saved fuel state from disk on startup.
-        Falls back to a full tank if the file is missing or corrupt.
-        """
         try:
-            with open(FUEL_STATE_FILE, 'r') as fh:
-                data = json.load(fh)
+            with open(FUEL_STATE_FILE, 'r') as handle:
+                data = json.load(handle)
             self.gas_used_gallons = float(data.get('gas_used_gallons', 0.0))
-            print(
-                f"Loaded fuel state: {self.gas_used_gallons:.3f} gal used "
-                f"({self._gallons_remaining:.2f} gal remaining)."
-            )
-        except FileNotFoundError:
-            print("No fuel state file found — assuming a full tank.")
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            print(f"Fuel state file corrupt ({exc}) — assuming a full tank.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+            self.gas_used_gallons = 0.0
 
     def _save_fuel_state(self):
-        """Write current fuel state to disk (called every FUEL_SAVE_INTERVAL seconds)."""
         try:
             data = {
-                'gas_used_gallons':  self.gas_used_gallons,
-                'saved_at':          datetime.now().isoformat(),
+                'gas_used_gallons': self.gas_used_gallons,
+                'saved_at': datetime.now().isoformat(),
             }
-            # Write atomically via a temp file to avoid corruption on power loss
             tmp_path = FUEL_STATE_FILE + '.tmp'
-            with open(tmp_path, 'w') as fh:
-                json.dump(data, fh, indent=2)
+            with open(tmp_path, 'w') as handle:
+                json.dump(data, handle, indent=2)
             os.replace(tmp_path, FUEL_STATE_FILE)
         except OSError as exc:
-            print(f"Warning: could not save fuel state: {exc}")
+            self.status_message = f'Fuel save failed: {exc}'
 
     def _fill_tank(self):
-        """Reset fuel consumption to zero (full tank) and persist immediately."""
         self.gas_used_gallons = 0.0
         self._save_fuel_state()
-        print("Tank reset to full.")
-
-    # -----------------------------------------------------------------------
-    # Derived fuel properties
-    # -----------------------------------------------------------------------
 
     @property
     def _gallons_remaining(self) -> float:
@@ -230,552 +167,300 @@ class OBDDashboard:
 
     @property
     def _distance_to_empty_mi(self) -> float:
-        """Estimated miles remaining based on current average MPG."""
         avg_mpg = self.vehicle_data['avg_mpg']
         if avg_mpg <= 0:
             return 0.0
         return self._gallons_remaining * avg_mpg
 
-    @property
-    def _fuel_percent(self) -> float:
-        return self._gallons_remaining / TANK_CAPACITY_GALLONS
+    def _toggle_relay(self, relay_key: str):
+        if not self.gpio_available:
+            self.status_message = 'GPIO is unavailable on this system.'
+            return
 
-    # -----------------------------------------------------------------------
-    # UI construction
-    # -----------------------------------------------------------------------
-
-    def _create_ui(self):
-        """Build (or rebuild) the complete UI from scratch."""
-        colors = COLORS['night' if self.night_mode else 'day']
-        self.root.configure(bg=colors['bg'])
-
-        main_frame = tk.Frame(self.root, bg=colors['bg'])
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        if self.show_trip_stats:
-            self._create_trip_stats_view(main_frame, colors)
-        else:
-            self._create_gauge_view(main_frame, colors)
-
-        self._create_control_bar(main_frame, colors)
-
-    def _create_gauge_view(self, parent: tk.Frame, colors: dict):
-        """Standard driving view: speed, RPM, and secondary gauges."""
-
-        # ── Primary gauges: Speed and RPM ────────────────────────────────
-        primary_row = tk.Frame(parent, bg=colors['bg'])
-        primary_row.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        self.speed_frame = self._make_large_gauge(primary_row, "SPEED", "MPH")
-        self.speed_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-
-        self.rpm_frame = self._make_large_gauge(primary_row, "RPM", "")
-        self.rpm_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
-
-        # ── Secondary gauges: row 1 ───────────────────────────────────────
-        secondary_row1 = tk.Frame(parent, bg=colors['bg'])
-        secondary_row1.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
-
-        self.coolant_frame     = self._make_small_gauge(secondary_row1, "COOLANT",  "°F")
-        self.coolant_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.load_frame        = self._make_small_gauge(secondary_row1, "ENG LOAD", "%")
-        self.load_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.instant_mpg_frame = self._make_small_gauge(secondary_row1, "INST MPG", "mpg")
-        self.instant_mpg_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        # ── Secondary gauges: row 2 ───────────────────────────────────────
-        secondary_row2 = tk.Frame(parent, bg=colors['bg'])
-        secondary_row2.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
-
-        self.intake_frame      = self._make_small_gauge(secondary_row2, "INTAKE",   "°F")
-        self.intake_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.avg_mpg_frame     = self._make_small_gauge(secondary_row2, "AVG MPG",  "mpg")
-        self.avg_mpg_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.dte_frame         = self._make_small_gauge(secondary_row2, "RANGE",    "mi")
-        self.dte_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-    def _create_trip_stats_view(self, parent: tk.Frame, colors: dict):
-        """Trip statistics + distance-to-empty view."""
-        outer = tk.Frame(parent, bg=colors['bg'])
-        outer.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        # Title
-        tk.Label(
-            outer,
-            text="TRIP STATISTICS",
-            font=tkfont.Font(size=24, weight='bold'),
-            bg=colors['bg'],
-            fg=colors['accent'],
-        ).pack(pady=(10, 12))
-
-        # ── Trip stat cards ───────────────────────────────────────────────
-        cards_frame = tk.Frame(outer, bg=colors['bg'])
-        cards_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.trip_duration_frame = self._make_stat_card(cards_frame, "TRIP DURATION",    "00:00:00")
-        self.trip_duration_frame.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        self.trip_distance_frame = self._make_stat_card(cards_frame, "DISTANCE TRAVELED","0.0 mi")
-        self.trip_distance_frame.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        self.trip_avg_mpg_frame  = self._make_stat_card(cards_frame, "AVERAGE MPG",      "0.0 mpg")
-        self.trip_avg_mpg_frame.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        # ── Fuel / Distance-to-empty card ─────────────────────────────────
-        self.dte_card_frame = self._make_dte_card(cards_frame, colors)
-        self.dte_card_frame.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        # ── Action buttons ────────────────────────────────────────────────
-        btn_row = tk.Frame(outer, bg=colors['bg'])
-        btn_row.pack(pady=(12, 0))
-
-        tk.Button(
-            btn_row,
-            text="← BACK",
-            command=self._toggle_trip_view,
-            font=tkfont.Font(size=16, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['accent'],
-            relief=tk.RAISED,
-            bd=3,
-            height=2,
-            width=12,
-        ).pack(side=tk.LEFT, padx=5)
-
-        tk.Button(
-            btn_row,
-            text="RESET TRIP",
-            command=self._reset_trip,
-            font=tkfont.Font(size=16, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['warning'],
-            relief=tk.RAISED,
-            bd=3,
-            height=2,
-            width=12,
-        ).pack(side=tk.LEFT, padx=5)
-
-        tk.Button(
-            btn_row,
-            text="⛽ FILL TANK",
-            command=self._fill_tank_and_refresh,
-            font=tkfont.Font(size=16, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['dte_ok'],
-            relief=tk.RAISED,
-            bd=3,
-            height=2,
-            width=12,
-        ).pack(side=tk.LEFT, padx=5)
-
-    def _make_dte_card(self, parent: tk.Frame, colors: dict) -> tk.Frame:
-        """Create the distance-to-empty summary card for the trip stats view."""
-        frame = tk.Frame(
-            parent,
-            bg=colors['gauge_bg'],
-            relief=tk.SOLID,
-            bd=2,
-            highlightbackground=colors['gauge_border'],
-            highlightthickness=2,
-        )
-
-        # Two columns side by side
-        left  = tk.Frame(frame, bg=colors['gauge_bg'])
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=6)
-        right = tk.Frame(frame, bg=colors['gauge_bg'])
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=6)
-
-        # Left: distance to empty
-        tk.Label(left, text="RANGE",
-                 font=tkfont.Font(size=13, weight='bold'),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack()
-        self.dte_value_label = tk.Label(
-            left, text="--- mi",
-            font=tkfont.Font(size=30, weight='bold'),
-            bg=colors['gauge_bg'], fg=colors['dte_ok'],
-        )
-        self.dte_value_label.pack()
-
-        # Right: fuel remaining
-        tk.Label(right, text="FUEL REMAINING",
-                 font=tkfont.Font(size=13, weight='bold'),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack()
-        self.fuel_remaining_label = tk.Label(
-            right, text="--- gal",
-            font=tkfont.Font(size=30, weight='bold'),
-            bg=colors['gauge_bg'], fg=colors['dte_ok'],
-        )
-        self.fuel_remaining_label.pack()
-
-        return frame
-
-    def _create_control_bar(self, parent: tk.Frame, colors: dict):
-        """Bottom row of control buttons, always visible."""
-        bar = tk.Frame(parent, bg=colors['bg'])
-        bar.pack(fill=tk.X, pady=(8, 0))
-
-        # Light toggle buttons
-        self.pod_btn   = self._make_relay_button(bar, "Pod Lights", 'pod_lights')
-        self.pod_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.amber_btn = self._make_relay_button(bar, "Amber Bar",  'amber_bar')
-        self.amber_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.white_btn = self._make_relay_button(bar, "White Bar",  'white_bar')
-        self.white_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        # Trip stats toggle
-        tk.Button(
-            bar,
-            text="TRIP",
-            command=self._toggle_trip_view,
-            font=tkfont.Font(size=14, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['accent'],
-            relief=tk.RAISED,
-            bd=3,
-            height=3,
-        ).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        # Day / night toggle
-        mode_label = "🌙 NIGHT" if self.night_mode else "☀️ DAY"
-        tk.Button(
-            bar,
-            text=mode_label,
-            command=self._toggle_day_night,
-            font=tkfont.Font(size=14, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['accent'],
-            relief=tk.RAISED,
-            bd=3,
-            height=3,
-        ).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-    # -----------------------------------------------------------------------
-    # Widget factories
-    # -----------------------------------------------------------------------
-
-    def _make_large_gauge(self, parent: tk.Frame, title: str, unit: str) -> tk.Frame:
-        colors = COLORS['night' if self.night_mode else 'day']
-        frame = tk.Frame(
-            parent, bg=colors['gauge_bg'], relief=tk.SOLID, bd=2,
-            highlightbackground=colors['gauge_border'], highlightthickness=2,
-        )
-        tk.Label(frame, text=title,
-                 font=tkfont.Font(size=18, weight='bold'),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack(pady=(10, 0))
-
-        value_lbl = tk.Label(frame, text="---",
-                             font=tkfont.Font(size=72, weight='bold'),
-                             bg=colors['gauge_bg'], fg=colors['accent'])
-        value_lbl.pack(expand=True)
-
-        tk.Label(frame, text=unit,
-                 font=tkfont.Font(size=16),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack(pady=(0, 10))
-
-        frame.value_label = value_lbl
-        return frame
-
-    def _make_small_gauge(self, parent: tk.Frame, title: str, unit: str) -> tk.Frame:
-        colors = COLORS['night' if self.night_mode else 'day']
-        frame = tk.Frame(
-            parent, bg=colors['gauge_bg'], relief=tk.SOLID, bd=1,
-            highlightbackground=colors['gauge_border'], highlightthickness=1,
-        )
-        tk.Label(frame, text=title,
-                 font=tkfont.Font(size=10, weight='bold'),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack(pady=(5, 0))
-
-        value_lbl = tk.Label(frame, text="---",
-                             font=tkfont.Font(size=28, weight='bold'),
-                             bg=colors['gauge_bg'], fg=colors['accent'])
-        value_lbl.pack(expand=True)
-
-        tk.Label(frame, text=unit,
-                 font=tkfont.Font(size=9),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack(pady=(0, 5))
-
-        frame.value_label = value_lbl
-        return frame
-
-    def _make_stat_card(self, parent: tk.Frame, label: str, initial: str) -> tk.Frame:
-        colors = COLORS['night' if self.night_mode else 'day']
-        frame = tk.Frame(
-            parent, bg=colors['gauge_bg'], relief=tk.SOLID, bd=2,
-            highlightbackground=colors['gauge_border'], highlightthickness=2,
-        )
-        tk.Label(frame, text=label,
-                 font=tkfont.Font(size=14, weight='bold'),
-                 bg=colors['gauge_bg'], fg=colors['text']).pack(pady=(8, 2))
-
-        value_lbl = tk.Label(frame, text=initial,
-                             font=tkfont.Font(size=36, weight='bold'),
-                             bg=colors['gauge_bg'], fg=colors['accent'])
-        value_lbl.pack(pady=(2, 8))
-
-        frame.value_label = value_lbl
-        return frame
-
-    def _make_relay_button(self, parent: tk.Frame, label: str, relay_key: str) -> tk.Button:
-        """Create a latching ON/OFF button that controls a relay."""
-        colors = COLORS['night' if self.night_mode else 'day']
-        btn = tk.Button(
-            parent,
-            text=f"{label}\nOFF",
-            font=tkfont.Font(size=14, weight='bold'),
-            bg=colors['button_bg'],
-            fg=colors['text'],
-            activebackground=colors['button_active'],
-            relief=tk.RAISED,
-            bd=3,
-            height=3,
-        )
-        btn.config(command=lambda: self._toggle_relay(relay_key, btn))
-        return btn
-
-    # -----------------------------------------------------------------------
-    # UI interactions
-    # -----------------------------------------------------------------------
-
-    def _toggle_relay(self, relay_key: str, button: tk.Button):
-        """Flip a relay and update the button to reflect the new state."""
         self.relay_states[relay_key] = not self.relay_states[relay_key]
         is_on = self.relay_states[relay_key]
-
         GPIO.output(RELAY_PINS[relay_key], GPIO.LOW if is_on else GPIO.HIGH)
+        self.status_message = f"{RELAY_LABELS[relay_key]} {'ON' if is_on else 'OFF'}"
 
-        colors = COLORS['night' if self.night_mode else 'day']
-        name   = button.cget('text').split('\n')[0]   # preserve the label text
-        if is_on:
-            button.config(text=f"{name}\nON",  bg=colors['button_active'], relief=tk.SUNKEN)
-        else:
-            button.config(text=f"{name}\nOFF", bg=colors['button_bg'],     relief=tk.RAISED)
+    def _reset_trip(self):
+        self.trip_start_time = datetime.now()
+        self.trip_distance_mi = 0.0
+        self.mpg_history.clear()
+        self.status_message = 'Trip statistics reset.'
 
     def _toggle_trip_view(self):
         self.show_trip_stats = not self.show_trip_stats
-        self._rebuild_ui()
 
-    def _toggle_day_night(self):
+    def _toggle_night_mode(self):
         self.night_mode = not self.night_mode
-        self._rebuild_ui()
-
-    def _reset_trip(self):
-        """Clear trip timer, distance, and MPG history."""
-        self.trip_start_time  = datetime.now()
-        self.trip_distance_mi = 0.0
-        self.mpg_history.clear()
-        print("Trip statistics reset.")
-
-    def _fill_tank_and_refresh(self):
-        """Reset the tank to full and refresh the UI so the DTE updates immediately."""
-        self._fill_tank()
-        self._rebuild_ui()
-
-    def _rebuild_ui(self):
-        """Destroy and recreate all widgets (used after mode/view changes)."""
-        for widget in self.root.winfo_children():
-            widget.destroy()
-        self._create_ui()
-
-    # -----------------------------------------------------------------------
-    # OBD polling loop (background thread)
-    # -----------------------------------------------------------------------
 
     def _obd_update_loop(self):
-        """
-        Continuously query the OBD-II adapter.
-        Runs in a daemon thread; updates vehicle_data then schedules a UI refresh.
-        Also handles periodic saving of the fuel state.
-        """
         while self.running:
-            if self.connection and self.connection.status() == OBDStatus.CAR_CONNECTED:
-                try:
+            try:
+                if self.connection and self.connection.status() == OBDStatus.CAR_CONNECTED:
                     self._poll_obd()
-                except Exception as exc:
-                    print(f"OBD polling error: {exc}")
+                elif time.time() - self.last_connection_attempt >= 10:
+                    self._connect_obd()
+            except Exception as exc:
+                self.connection_status = 'OBD polling error'
+                self.status_message = f'OBD polling error: {exc}'
 
-            # Save fuel state every FUEL_SAVE_INTERVAL seconds
             if time.time() - self.last_fuel_save >= FUEL_SAVE_INTERVAL:
                 self._save_fuel_state()
                 self.last_fuel_save = time.time()
 
-            # Schedule display update on the main (Tkinter) thread
-            self.root.after(0, self._update_display)
-
-            time.sleep(0.5)  # poll at ~2 Hz
+            time.sleep(0.5)
 
     def _poll_obd(self):
-        """Read all OBD-II sensors and update vehicle_data / fuel tracking."""
-        speed_resp   = self.connection.query(obd.commands.SPEED)
-        rpm_resp     = self.connection.query(obd.commands.RPM)
+        speed_resp = self.connection.query(obd.commands.SPEED)
+        rpm_resp = self.connection.query(obd.commands.RPM)
         coolant_resp = self.connection.query(obd.commands.COOLANT_TEMP)
-        load_resp    = self.connection.query(obd.commands.ENGINE_LOAD)
-        intake_resp  = self.connection.query(obd.commands.INTAKE_TEMP)
-        maf_resp     = self.connection.query(obd.commands.MAF)
+        load_resp = self.connection.query(obd.commands.ENGINE_LOAD)
+        intake_resp = self.connection.query(obd.commands.INTAKE_TEMP)
+        maf_resp = self.connection.query(obd.commands.MAF)
 
-        # Speed (apply tire-size correction)
-        if not speed_resp.is_null():
-            raw_mph = speed_resp.value.to('mph').magnitude
-            self.vehicle_data['speed'] = raw_mph * TIRE_CORRECTION_FACTOR
+        with self.state_lock:
+            if not speed_resp.is_null():
+                raw_mph = speed_resp.value.to('mph').magnitude
+                self.vehicle_data['speed'] = raw_mph * TIRE_CORRECTION_FACTOR
 
-        if not rpm_resp.is_null():
-            self.vehicle_data['rpm'] = rpm_resp.value.magnitude
+            if not rpm_resp.is_null():
+                self.vehicle_data['rpm'] = rpm_resp.value.magnitude
 
-        if not coolant_resp.is_null():
-            self.vehicle_data['coolant_temp'] = coolant_resp.value.to('degF').magnitude
+            if not coolant_resp.is_null():
+                self.vehicle_data['coolant_temp'] = coolant_resp.value.to('degF').magnitude
 
-        if not load_resp.is_null():
-            self.vehicle_data['engine_load'] = load_resp.value.magnitude
+            if not load_resp.is_null():
+                self.vehicle_data['engine_load'] = load_resp.value.magnitude
 
-        if not intake_resp.is_null():
-            self.vehicle_data['intake_temp'] = intake_resp.value.to('degF').magnitude
+            if not intake_resp.is_null():
+                self.vehicle_data['intake_temp'] = intake_resp.value.to('degF').magnitude
 
-        # ── Distance tracking ─────────────────────────────────────────────
-        now        = time.time()
-        elapsed_hr = (now - self.last_obd_time) / 3600.0
-        speed      = self.vehicle_data['speed']
+            now = time.time()
+            elapsed_hr = (now - self.last_obd_time) / 3600.0
+            speed = self.vehicle_data['speed']
 
-        if speed > 0 and elapsed_hr > 0:
-            self.trip_distance_mi += speed * elapsed_hr
+            if speed > 0 and elapsed_hr > 0:
+                self.trip_distance_mi += speed * elapsed_hr
 
-        self.last_obd_time = now
+            self.last_obd_time = now
 
-        # ── MPG + fuel consumption ────────────────────────────────────────
-        if not maf_resp.is_null() and speed > 0:
-            maf_g_per_s = maf_resp.value.magnitude   # grams/second
+            if not maf_resp.is_null() and speed > 0:
+                maf_g_per_s = maf_resp.value.magnitude
+                if maf_g_per_s > 0:
+                    instant_mpg = (speed * 7.107) / maf_g_per_s
+                    self.vehicle_data['instant_mpg'] = min(instant_mpg, 99.9)
+                    self.mpg_history.append(instant_mpg)
+                    self.vehicle_data['avg_mpg'] = sum(self.mpg_history) / len(self.mpg_history)
 
-            if maf_g_per_s > 0:
-                # Instantaneous MPG:
-                #   (speed mph * 7.107 conversion factor) / MAF g/s
-                instant_mpg = (speed * 7.107) / maf_g_per_s
-                self.vehicle_data['instant_mpg'] = min(instant_mpg, 99.9)
-                self.mpg_history.append(instant_mpg)
+                    lb_per_hr = maf_g_per_s * 0.002205 * 3600
+                    gal_per_hr = lb_per_hr / 6.17
+                    self.gas_used_gallons += gal_per_hr * elapsed_hr
 
-                # Average MPG over the trip
-                self.vehicle_data['avg_mpg'] = (
-                    sum(self.mpg_history) / len(self.mpg_history)
-                )
+    def _snapshot(self):
+        with self.state_lock:
+            return {
+                'vehicle_data': dict(self.vehicle_data),
+                'relay_states': dict(self.relay_states),
+                'trip_distance_mi': self.trip_distance_mi,
+                'trip_duration': datetime.now() - self.trip_start_time,
+                'gas_used_gallons': self.gas_used_gallons,
+                'gallons_remaining': self._gallons_remaining,
+                'distance_to_empty_mi': self._distance_to_empty_mi,
+                'night_mode': self.night_mode,
+                'show_trip_stats': self.show_trip_stats,
+                'connection_status': self.connection_status,
+                'status_message': self.status_message,
+            }
 
-                # Fuel consumed this interval:
-                #   MAF (g/s) → lb/hr → gal/hr (gasoline ≈ 6.17 lb/gal)
-                #   gal/hr × elapsed_hr = gallons used
-                lb_per_hr  = maf_g_per_s * 0.002205 * 3600
-                gal_per_hr = lb_per_hr / 6.17
-                self.gas_used_gallons += gal_per_hr * elapsed_hr
-
-    # -----------------------------------------------------------------------
-    # Display update (called on main thread)
-    # -----------------------------------------------------------------------
-
-    def _update_display(self):
+    def _safe_add(self, window, y, x, text, attr=0):
+        height, width = window.getmaxyx()
+        if y < 0 or y >= height or x >= width:
+            return
         try:
-            if self.show_trip_stats:
-                self._refresh_trip_stats()
-            else:
-                self._refresh_gauges()
-        except AttributeError:
-            # Widgets may not exist during a UI rebuild — safe to ignore
+            window.addstr(y, x, str(text)[: max(0, width - x - 1)], attr)
+        except curses.error:
             pass
 
-    def _refresh_gauges(self):
-        """Push current vehicle_data values into the gauge widgets."""
-        d = self.vehicle_data
-        self.speed_frame.value_label.config(text=f"{int(d['speed'])}")
-        self.rpm_frame.value_label.config(text=f"{int(d['rpm'])}")
-        self.coolant_frame.value_label.config(text=f"{int(d['coolant_temp'])}")
-        self.load_frame.value_label.config(text=f"{int(d['engine_load'])}")
-        self.instant_mpg_frame.value_label.config(text=f"{d['instant_mpg']:.1f}")
-        self.avg_mpg_frame.value_label.config(text=f"{d['avg_mpg']:.1f}")
-        self.intake_frame.value_label.config(text=f"{int(d['intake_temp'])}")
+    def _draw_horizontal_rule(self, window, y, width):
+        if y < window.getmaxyx()[0]:
+            try:
+                window.hline(y, 0, curses.ACS_HLINE, max(0, width))
+            except curses.error:
+                pass
 
-        # Distance-to-empty gauge with colour coding
-        dte = self._distance_to_empty_mi
-        dte_color = self._dte_color(dte)
-        self.dte_frame.value_label.config(
-            text=f"{int(dte)}",
-            fg=dte_color,
+    def _render_metric_line(self, window, y, metrics, width, label_attr, value_attr):
+        column_width = max(18, width // max(1, len(metrics)))
+        x = 0
+        for label, value in metrics:
+            text = f'{label}: '
+            self._safe_add(window, y, x, text, label_attr)
+            self._safe_add(window, y, x + len(text), value, value_attr)
+            x += column_width
+
+    def _render(self, window):
+        snapshot = self._snapshot()
+        window.erase()
+        height, width = window.getmaxyx()
+
+        if width < 80 or height < 18:
+            self._safe_add(window, 0, 0, 'TacomaDashboard', curses.A_BOLD)
+            self._safe_add(window, 1, 0, 'Terminal too small. Resize for full dashboard.')
+            self._safe_add(window, 3, 0, 'q quit | 1/2/3 relay toggle | t trip view | r reset trip | f fill tank | n theme')
+            window.refresh()
+            return
+
+        header_attr = curses.A_REVERSE if snapshot['night_mode'] else curses.A_BOLD
+        self._safe_add(
+            window,
+            0,
+            0,
+            f"TacomaDashboard | {snapshot['connection_status']} | Mode: {'TRIP' if snapshot['show_trip_stats'] else 'GAUGES'} | {snapshot['status_message']}",
+            header_attr,
         )
+        self._draw_horizontal_rule(window, 1, width)
 
-    def _refresh_trip_stats(self):
-        """Update trip statistics cards and the DTE card."""
-        # Trip duration
-        elapsed = datetime.now() - self.trip_start_time
-        total_s = int(elapsed.total_seconds())
-        h, rem  = divmod(total_s, 3600)
-        m, s    = divmod(rem, 60)
-
-        if hasattr(self, 'trip_duration_frame'):
-            self.trip_duration_frame.value_label.config(text=f"{h:02d}:{m:02d}:{s:02d}")
-
-        if hasattr(self, 'trip_distance_frame'):
-            self.trip_distance_frame.value_label.config(
-                text=f"{self.trip_distance_mi:.1f} mi"
+        vehicle = snapshot['vehicle_data']
+        if snapshot['show_trip_stats']:
+            self._safe_add(window, 2, 0, 'TRIP STATISTICS', curses.A_BOLD)
+            self._render_metric_line(
+                window,
+                4,
+                [
+                    ('Trip Time', _format_duration(int(snapshot['trip_duration'].total_seconds()))),
+                    ('Trip Dist', f"{snapshot['trip_distance_mi']:.1f} mi"),
+                    ('Avg MPG', f"{vehicle['avg_mpg']:.1f} mpg"),
+                ],
+                width,
+                curses.A_BOLD,
+                curses.A_NORMAL,
+            )
+            self._render_metric_line(
+                window,
+                6,
+                [
+                    ('Fuel Used', f"{snapshot['gas_used_gallons']:.2f} gal"),
+                    ('Fuel Left', f"{snapshot['gallons_remaining']:.2f} gal"),
+                    ('Range', f"{snapshot['distance_to_empty_mi']:.0f} mi"),
+                ],
+                width,
+                curses.A_BOLD,
+                curses.A_NORMAL,
+            )
+        else:
+            self._safe_add(window, 2, 0, 'LIVE DATA', curses.A_BOLD)
+            self._render_metric_line(
+                window,
+                4,
+                [
+                    ('Speed', f"{vehicle['speed']:.0f} mph"),
+                    ('RPM', f"{vehicle['rpm']:.0f}"),
+                    ('Coolant', f"{vehicle['coolant_temp']:.0f} F"),
+                ],
+                width,
+                curses.A_BOLD,
+                curses.A_NORMAL,
+            )
+            self._render_metric_line(
+                window,
+                6,
+                [
+                    ('Load', f"{vehicle['engine_load']:.0f}%"),
+                    ('Intake', f"{vehicle['intake_temp']:.0f} F"),
+                    ('Inst MPG', f"{vehicle['instant_mpg']:.1f}"),
+                ],
+                width,
+                curses.A_BOLD,
+                curses.A_NORMAL,
+            )
+            self._render_metric_line(
+                window,
+                8,
+                [
+                    ('Avg MPG', f"{vehicle['avg_mpg']:.1f}"),
+                    ('Range', f"{snapshot['distance_to_empty_mi']:.0f} mi"),
+                    ('Fuel Left', f"{snapshot['gallons_remaining']:.2f} gal"),
+                ],
+                width,
+                curses.A_BOLD,
+                curses.A_NORMAL,
             )
 
-        avg_mpg = self.vehicle_data['avg_mpg']
-        if hasattr(self, 'trip_avg_mpg_frame'):
-            self.trip_avg_mpg_frame.value_label.config(text=f"{avg_mpg:.1f} mpg")
+        self._draw_horizontal_rule(window, 10, width)
+        relay_text = '  '.join(
+            f"[{index + 1} {RELAY_LABELS[key]}: {'ON' if snapshot['relay_states'][key] else 'OFF'}]"
+            for index, key in enumerate(RELAY_PINS)
+        )
+        self._safe_add(window, 11, 0, f'Relays: {relay_text}')
+        self._safe_add(window, 13, 0, 'Controls: 1 pod lights | 2 amber bar | 3 white bar | t trip view | r reset trip | f fill tank | n theme | q quit')
+        self._safe_add(window, 14, 0, 'Fuel state is saved automatically every 30 seconds.')
+        window.refresh()
 
-        # Distance-to-empty card
-        dte       = self._distance_to_empty_mi
-        gal_left  = self._gallons_remaining
-        dte_color = self._dte_color(dte)
+    def _handle_key(self, key):
+        if key in (ord('q'), 27):
+            self.request_exit()
+        elif key == ord('1'):
+            self._toggle_relay('pod_lights')
+        elif key == ord('2'):
+            self._toggle_relay('amber_bar')
+        elif key == ord('3'):
+            self._toggle_relay('white_bar')
+        elif key in (ord('t'), ord('T')):
+            self._toggle_trip_view()
+            self.status_message = 'Trip view toggled.'
+        elif key in (ord('r'), ord('R')):
+            self._reset_trip()
+        elif key in (ord('f'), ord('F')):
+            self._fill_tank()
+            self.status_message = 'Tank marked full.'
+        elif key in (ord('n'), ord('N')):
+            self._toggle_night_mode()
+            self.status_message = 'Theme toggled.'
 
-        if hasattr(self, 'dte_value_label'):
-            self.dte_value_label.config(text=f"{int(dte)} mi", fg=dte_color)
-
-        if hasattr(self, 'fuel_remaining_label'):
-            self.fuel_remaining_label.config(text=f"{gal_left:.1f} gal", fg=dte_color)
-
-    def _dte_color(self, dte_miles: float) -> str:
-        """Return a colour string based on the estimated range remaining."""
-        colors = COLORS['night' if self.night_mode else 'day']
-        if dte_miles < 30:
-            return colors['dte_low']
-        if dte_miles < 75:
-            return colors['dte_mid']
-        return colors['dte_ok']
-
-    # -----------------------------------------------------------------------
-    # Shutdown
-    # -----------------------------------------------------------------------
-
-    def _cleanup_and_exit(self):
-        """Save state, turn off relays, and exit cleanly."""
-        print("Shutting down…")
+    def request_exit(self):
         self.running = False
 
+    def _cleanup(self):
+        self.running = False
         self._save_fuel_state()
-
-        for pin in RELAY_PINS.values():
-            GPIO.output(pin, GPIO.HIGH)   # active-LOW: HIGH = OFF
-        GPIO.cleanup()
-
+        try:
+            for pin in RELAY_PINS.values():
+                GPIO.output(pin, GPIO.HIGH)
+            GPIO.cleanup()
+        except Exception:
+            pass
         if self.connection:
-            self.connection.close()
+            with suppress(Exception):
+                self.connection.close()
 
-        self.root.quit()
+    def run(self):
+        signal.signal(signal.SIGINT, lambda _signum, _frame: self.request_exit())
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: self.request_exit())
+        curses.wrapper(self._curses_main)
+        self._cleanup()
 
+    def _curses_main(self, window):
+        with suppress(curses.error):
+            curses.curs_set(0)
+        window.nodelay(True)
+        window.keypad(True)
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+        while self.running:
+            self._render(window)
+            key = window.getch()
+            if key != -1:
+                self._handle_key(key)
+            time.sleep(0.1)
+
 
 def main():
-    root = tk.Tk()
-    OBDDashboard(root)
-    root.mainloop()
+    dashboard = OBDDashboardConsole()
+    dashboard.run()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
