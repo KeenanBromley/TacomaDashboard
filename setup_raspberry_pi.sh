@@ -12,10 +12,9 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 LOGIN_USER="${PI_AUTOLOGIN_USER:-${SUDO_USER:-${USER}}}"
-BASH_PROFILE_FILE="$HOME/.bash_profile"
 DESKTOP_AUTOSTART_FILE="$HOME/.config/autostart/tacomadashboard.desktop"
-GETTY_OVERRIDE_DIR="/etc/systemd/system/getty@tty1.service.d"
-GETTY_OVERRIDE_FILE="$GETTY_OVERRIDE_DIR/override.conf"
+LIGHTDM_AUTLOGIN_DIR="/etc/lightdm/lightdm.conf.d"
+LIGHTDM_AUTLOGIN_FILE="$LIGHTDM_AUTLOGIN_DIR/99-tacomadashboard.conf"
 BOOT_CMDLINE_FILE="/boot/firmware/cmdline.txt"
 BOOT_CONFIG_FILE="/boot/firmware/config.txt"
 if [[ ! -f "$BOOT_CMDLINE_FILE" ]]; then
@@ -33,10 +32,6 @@ sudo apt-get install -y --no-install-recommends \
 	python3-venv \
 	python3-tk \
 	python3-rpi.gpio \
-	xserver-xorg-core \
-	xserver-xorg-video-fbdev \
-	xserver-xorg-input-libinput \
-	xinit \
 	x11-xserver-utils
 
 echo "Creating Python virtual environment..."
@@ -74,7 +69,7 @@ if [[ -n "${PI_HOSTNAME:-}" ]]; then
 	fi
 fi
 
-echo "Creating minimal X launcher..."
+echo "Creating desktop launcher..."
 cat > "$STARTUP_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -89,25 +84,33 @@ EOF
 
 chmod +x "$STARTUP_SCRIPT"
 
-echo "Configuring tty1 autologin startup..."
-rm -f "$DESKTOP_AUTOSTART_FILE"
-
-if ! grep -qF 'TacomaDashboard Lite OS launch' "$BASH_PROFILE_FILE" 2>/dev/null; then
-cat >> "$BASH_PROFILE_FILE" <<EOF
-# TacomaDashboard Lite OS launch
-if [ -z "\$DISPLAY" ] && [ "\$(tty)" = "/dev/tty1" ]; then
-	startx "$STARTUP_SCRIPT" -- -nocursor >/dev/null 2>&1
-fi
+echo "Configuring desktop autostart..."
+mkdir -p "$(dirname "$DESKTOP_AUTOSTART_FILE")"
+cat > "$DESKTOP_AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=TacomaDashboard
+Exec=$STARTUP_SCRIPT
+X-GNOME-Autostart-enabled=true
 EOF
+
+sudo mkdir -p "$LIGHTDM_AUTLOGIN_DIR"
+sudo tee "$LIGHTDM_AUTLOGIN_FILE" >/dev/null <<EOF
+[Seat:*]
+autologin-user=$LOGIN_USER
+autologin-user-timeout=0
+EOF
+
+if command -v raspi-config >/dev/null 2>&1; then
+	sudo raspi-config nonint do_boot_behaviour B4 >/dev/null 2>&1 || true
 fi
 
-sudo mkdir -p "$GETTY_OVERRIDE_DIR"
-sudo tee "$GETTY_OVERRIDE_FILE" >/dev/null <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin $LOGIN_USER --noclear %I linux
-EOF
+if [[ "${PI_DISABLE_UNUSED_SERVICES:-0}" =~ ^(1|true|yes|on)$ ]]; then
+	for service_name in bluetooth hciuart avahi-daemon; do
+		sudo systemctl disable "$service_name" >/dev/null 2>&1 || true
+	done
+fi
 
 sudo systemctl daemon-reload
 
-echo "Setup complete. Reboot the Pi to boot into the touchscreen dashboard from Raspberry Pi OS Lite."
+echo "Setup complete. Reboot the Pi to boot into the touchscreen dashboard from Raspberry Pi OS desktop."

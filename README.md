@@ -1,6 +1,6 @@
 # TacomaDashboard
 
-TacomaDashboard turns a Raspberry Pi into a truck dashboard for a 2011 Toyota Tacoma. It is designed for Raspberry Pi OS Lite plus a minimal X session so you can use the touchscreen, color interface, and fullscreen layout without running a full desktop environment.
+TacomaDashboard turns a Raspberry Pi into a truck dashboard for a 2011 Toyota Tacoma. It is designed for Raspberry Pi OS with the standard desktop so you can use the touchscreen, color interface, and fullscreen layout.
 
 ## What It Does
 
@@ -16,9 +16,9 @@ The project is a Python/Tkinter application that:
 
 ## How It Works
 
-1. The Raspberry Pi boots into Raspberry Pi OS Lite with quiet boot settings.
-2. TTY1 autologin starts automatically.
-3. `startx` launches a bare X session with no desktop manager or taskbar.
+1. The Raspberry Pi boots into Raspberry Pi OS desktop.
+2. The configured user logs in automatically.
+3. The desktop autostart entry launches `start_dashboard.sh`.
 4. `start_dashboard.sh` disables screen blanking, suppresses terminal noise, and starts `dashboard.py`.
 5. The app opens a fullscreen Tkinter window.
 6. A background thread polls the OBD-II adapter about twice per second.
@@ -44,7 +44,7 @@ Notes:
 
 ## Installation
 
-Run the setup script on the Raspberry Pi OS Lite install after cloning the repo:
+Run the setup script on a Raspberry Pi OS desktop install after cloning the repo:
 
 ```bash
 chmod +x setup_raspberry_pi.sh
@@ -53,10 +53,10 @@ chmod +x setup_raspberry_pi.sh
 
 The script will:
 
-- Install the required Raspberry Pi system packages for a minimal X session.
+- Install the required Raspberry Pi system packages for the dashboard.
 - Create a local Python virtual environment.
 - Install the Python dependencies.
-- Configure tty1 autologin, quiet boot settings, and a minimal X launcher so the dashboard starts automatically at boot.
+- Configure desktop autologin and a desktop autostart entry so the dashboard starts automatically at boot.
 
 Before running the script, edit [`.env`](.env) to set the Pi hostname and the user that should autologin on boot.
 
@@ -80,19 +80,15 @@ Controls in the dashboard:
 - `n` toggles the visual theme.
 - `q` or `Esc` exits.
 
-## Lite OS Notes
+## Raspberry Pi OS Notes
 
-If you want the fastest possible boot to the dashboard, Raspberry Pi OS Lite is the better fit. The project will still use the same Tkinter interface and touchscreen layout, but without a desktop shell, panel, or other background apps.
+For the cleanest desktop startup, make sure the standard Raspberry Pi OS desktop is set to autologin for the user in [`.env`](.env).
 
 For screen tuning, you can optionally set display values in `/boot/config.txt` such as `disable_overscan=1` and the correct HDMI mode for your panel.
 
-The setup script also applies a black-screen boot style with `quiet splash loglevel=0 logo.nologo vt.global_cursor_default=0`, `disable_splash=1`, and `boot_delay=0`.
+The setup script also applies boot quieting with `quiet splash loglevel=0 logo.nologo vt.global_cursor_default=0`, `disable_splash=1`, and `boot_delay=0`.
 
-If you do not need Bluetooth or mDNS discovery, you can speed boot a bit more with:
-
-```bash
-sudo systemctl disable bluetooth hciuart avahi-daemon
-```
+If you are not using Bluetooth OBD or mDNS discovery, set `PI_DISABLE_UNUSED_SERVICES=1` in [`.env`](.env) before running the installer to disable `bluetooth`, `hciuart`, and `avahi-daemon`.
 
 ## Files
 
