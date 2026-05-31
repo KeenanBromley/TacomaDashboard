@@ -48,6 +48,11 @@ FUEL_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fuel
 
 # How often (seconds) to write the fuel state to disk
 FUEL_SAVE_INTERVAL = 30
+# Maximum stored MPG history length to avoid unbounded memory growth
+MPG_HISTORY_MAX = 300
+# EWMA smoothing factor for average MPG (alpha)
+# Higher alpha -> more responsive, lower alpha -> smoother long-term average
+EWMA_ALPHA = 0.05
 
 # ---------------------------------------------------------------------------
 # Color palettes
@@ -130,6 +135,8 @@ class OBDDashboard:
 
         # ── Fuel tracking (loaded from disk on startup) ───────────────────
         self.gas_used_gallons  = 0.0   # cumulative gallons consumed
+        self.saved_avg_mpg     = 0.0   # last saved avg mpg from disk
+        self.ewma_mpg          = None  # exponentially-weighted moving average state
         self.last_fuel_save    = time.time()
 
         self._load_fuel_state()
@@ -190,9 +197,16 @@ class OBDDashboard:
             with open(FUEL_STATE_FILE, 'r') as fh:
                 data = json.load(fh)
             self.gas_used_gallons = float(data.get('gas_used_gallons', 0.0))
+            # load last saved average MPG if present and seed EWMA
+            self.saved_avg_mpg = float(data.get('avg_mpg', 0.0))
+            if self.saved_avg_mpg > 0:
+                # seed EWMA state and vehicle_data so DTE is available immediately
+                self.ewma_mpg = self.saved_avg_mpg
+                self.vehicle_data['avg_mpg'] = self.saved_avg_mpg
+
             print(
                 f"Loaded fuel state: {self.gas_used_gallons:.3f} gal used "
-                f"({self._gallons_remaining:.2f} gal remaining)."
+                f"({self._gallons_remaining:.2f} gal remaining), avg_mpg={self.saved_avg_mpg:.1f}."
             )
         except FileNotFoundError:
             print("No fuel state file found — assuming a full tank.")
@@ -204,6 +218,8 @@ class OBDDashboard:
         try:
             data = {
                 'gas_used_gallons':  self.gas_used_gallons,
+                # persist the most recent average MPG so DTE is available after reboot
+                'avg_mpg':           float(self.vehicle_data.get('avg_mpg', 0.0)),
                 'saved_at':          datetime.now().isoformat(),
             }
             # Write atomically via a temp file to avoid corruption on power loss
@@ -231,7 +247,7 @@ class OBDDashboard:
     @property
     def _distance_to_empty_mi(self) -> float:
         """Estimated miles remaining based on current average MPG."""
-        avg_mpg = self.vehicle_data['avg_mpg']
+        avg_mpg = self.vehicle_data.get('avg_mpg', 0.0)
         if avg_mpg <= 0:
             return 0.0
         return self._gallons_remaining * avg_mpg
@@ -329,6 +345,19 @@ class OBDDashboard:
         self.dte_card_frame = self._make_dte_card(cards_frame, colors)
         self.dte_card_frame.pack(fill=tk.BOTH, expand=True, pady=4)
 
+        # Reduce stat card visual size: smaller value fonts for a denser trip screen
+        try:
+            smaller_val_font = tkfont.Font(size=28, weight='bold')
+            label_font = tkfont.Font(size=12, weight='bold')
+            self.trip_duration_frame.value_label.config(font=smaller_val_font)
+            self.trip_distance_frame.value_label.config(font=smaller_val_font)
+            self.trip_avg_mpg_frame.value_label.config(font=smaller_val_font)
+            # shrink DTE card numbers slightly
+            self.dte_value_label.config(font=tkfont.Font(size=24, weight='bold'))
+            self.fuel_remaining_label.config(font=tkfont.Font(size=24, weight='bold'))
+        except Exception:
+            pass
+
         # ── Action buttons ────────────────────────────────────────────────
         btn_row = tk.Frame(outer, bg=colors['bg'])
         btn_row.pack(pady=(12, 0))
@@ -337,42 +366,42 @@ class OBDDashboard:
             btn_row,
             text="← BACK",
             command=self._toggle_trip_view,
-            font=tkfont.Font(size=16, weight='bold'),
+            font=tkfont.Font(size=18, weight='bold'),
             bg=colors['button_bg'],
             fg=colors['text'],
             activebackground=colors['accent'],
             relief=tk.RAISED,
             bd=3,
-            height=2,
-            width=12,
+            height=3,
+            width=14,
         ).pack(side=tk.LEFT, padx=5)
 
         tk.Button(
             btn_row,
             text="RESET TRIP",
             command=self._reset_trip,
-            font=tkfont.Font(size=16, weight='bold'),
+            font=tkfont.Font(size=18, weight='bold'),
             bg=colors['button_bg'],
             fg=colors['text'],
             activebackground=colors['warning'],
             relief=tk.RAISED,
             bd=3,
-            height=2,
-            width=12,
+            height=3,
+            width=14,
         ).pack(side=tk.LEFT, padx=5)
 
         tk.Button(
             btn_row,
             text="⛽ FILL TANK",
             command=self._fill_tank_and_refresh,
-            font=tkfont.Font(size=16, weight='bold'),
+            font=tkfont.Font(size=18, weight='bold'),
             bg=colors['button_bg'],
             fg=colors['text'],
             activebackground=colors['dte_ok'],
             relief=tk.RAISED,
             bd=3,
-            height=2,
-            width=12,
+            height=3,
+            width=14,
         ).pack(side=tk.LEFT, padx=5)
 
     def _make_dte_card(self, parent: tk.Frame, colors: dict) -> tk.Frame:
@@ -446,7 +475,7 @@ class OBDDashboard:
         ).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
 
         # Day / night toggle
-        mode_label = "🌙 NIGHT" if self.night_mode else "☀️ DAY"
+        mode_label = "NIGHT" if self.night_mode else "DAY"
         tk.Button(
             bar,
             text=mode_label,
@@ -651,6 +680,10 @@ class OBDDashboard:
         self.last_obd_time = now
 
         # ── MPG + fuel consumption ────────────────────────────────────────
+        # Behavior changes requested:
+        # - If speed == 0 -> instant_mpg = 0 and append 0 to history
+        # - If avg_mpg for trip is 0, fall back to saved avg_mpg from disk
+        # - If saved avg_mpg is also 0, default to 15 mpg
         if not maf_resp.is_null() and speed > 0:
             maf_g_per_s = maf_resp.value.magnitude   # grams/second
 
@@ -658,13 +691,9 @@ class OBDDashboard:
                 # Instantaneous MPG:
                 #   (speed mph * 7.107 conversion factor) / MAF g/s
                 instant_mpg = (speed * 7.107) / maf_g_per_s
-                self.vehicle_data['instant_mpg'] = min(instant_mpg, 99.9)
+                instant_mpg = min(instant_mpg, 99.9)
+                self.vehicle_data['instant_mpg'] = instant_mpg
                 self.mpg_history.append(instant_mpg)
-
-                # Average MPG over the trip
-                self.vehicle_data['avg_mpg'] = (
-                    sum(self.mpg_history) / len(self.mpg_history)
-                )
 
                 # Fuel consumed this interval:
                 #   MAF (g/s) → lb/hr → gal/hr (gasoline ≈ 6.17 lb/gal)
@@ -672,6 +701,38 @@ class OBDDashboard:
                 lb_per_hr  = maf_g_per_s * 0.002205 * 3600
                 gal_per_hr = lb_per_hr / 6.17
                 self.gas_used_gallons += gal_per_hr * elapsed_hr
+        else:
+            # No valid MAF reading or not moving.
+            if speed == 0:
+                # When stationary, set instant MPG to 0 and include that in history
+                self.vehicle_data['instant_mpg'] = 0.0
+                self.mpg_history.append(0.0)
+
+        # Trim mpg_history to a reasonable maximum to avoid unbounded growth
+        while len(self.mpg_history) > MPG_HISTORY_MAX:
+            try:
+                self.mpg_history.popleft()
+            except IndexError:
+                break
+
+        # Update EWMA with the most recent instantaneous sample (if any)
+        # Prefer the last appended mpg sample if present
+        last_sample = self.mpg_history[-1] if len(self.mpg_history) > 0 else None
+        if last_sample is not None:
+            if self.ewma_mpg is None:
+                # initialize EWMA state with first sample
+                self.ewma_mpg = float(last_sample)
+            else:
+                # EWMA update: new = alpha*sample + (1-alpha)*old
+                self.ewma_mpg = (EWMA_ALPHA * float(last_sample)) + ((1 - EWMA_ALPHA) * self.ewma_mpg)
+
+        # Determine average MPG to display: use EWMA, else saved value, else safe default
+        if self.ewma_mpg is not None and self.ewma_mpg > 0:
+            self.vehicle_data['avg_mpg'] = float(self.ewma_mpg)
+        elif self.saved_avg_mpg > 0:
+            self.vehicle_data['avg_mpg'] = float(self.saved_avg_mpg)
+        else:
+            self.vehicle_data['avg_mpg'] = 15.0
 
     # -----------------------------------------------------------------------
     # Display update (called on main thread)

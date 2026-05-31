@@ -1,6 +1,6 @@
 # TacomaDashboard
 
-TacomaDashboard turns a Raspberry Pi into a truck dashboard for a 2011 Toyota Tacoma. It is designed for Raspberry Pi OS with the standard desktop so you can use the touchscreen, color interface, and fullscreen layout.
+TacomaDashboard turns a Raspberry Pi into a truck dashboard for a 2011 Toyota Tacoma. It uses Raspberry Pi OS desktop, a fullscreen Tkinter UI, and a root `@reboot` cron entry for startup.
 
 ## What It Does
 
@@ -12,18 +12,16 @@ The project is a Python/Tkinter application that:
 - Saves fuel state to disk so range estimates survive power cycles.
 - Controls three relay outputs for accessory lights from the touchscreen UI.
 - Starts in fullscreen mode and hides the cursor for a clean dash-style display.
-- Runs on Raspberry Pi OS Lite with a minimal X server for the fastest boot to dashboard time.
-
+- Runs on Raspberry Pi OS desktop and starts from a root `@reboot` cron job.
 ## How It Works
 
 1. The Raspberry Pi boots into Raspberry Pi OS desktop.
 2. The configured user logs in automatically.
-3. The desktop autostart entry launches `start_dashboard.sh`.
-4. `start_dashboard.sh` disables screen blanking, suppresses terminal noise, and starts `dashboard.py`.
-5. The app opens a fullscreen Tkinter window.
-6. A background thread polls the OBD-II adapter about twice per second.
-7. Fuel usage is estimated from MAF readings and written to `fuel_state.json` every 30 seconds.
-8. Touchscreen buttons toggle the relay outputs and switch between the live view and trip stats.
+3. A root `@reboot` cron job launches `dashboard.py` directly as root.
+4. The app opens a fullscreen Tkinter window.
+5. A background thread polls the OBD-II adapter about twice per second.
+6. Fuel usage is estimated from MAF readings and written to `fuel_state.json` every 30 seconds.
+7. Touchscreen buttons toggle the relay outputs and switch between the live view and trip stats.
 
 ## Raspberry Pi Wiring
 
@@ -44,29 +42,34 @@ Notes:
 
 ## Installation
 
-Run the setup script on a Raspberry Pi OS desktop install after cloning the repo:
+Install the required packages and the `obd` library with `sudo`:
 
 ```bash
-chmod +x setup_raspberry_pi.sh
-./setup_raspberry_pi.sh
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends python3 python3-pip python3-tk python3-rpi.gpio x11-xserver-utils
+sudo python3 -m pip install --upgrade pip
+sudo python3 -m pip install --break-system-packages obd
 ```
 
-The script will:
+Add the startup line with the root crontab editor:
 
-- Install the required Raspberry Pi system packages for the dashboard.
-- Create a local Python virtual environment.
-- Install the Python dependencies.
-- Configure desktop autologin and a desktop autostart entry so the dashboard starts automatically at boot.
+```bash
+sudo crontab -e
+```
 
-Before running the script, edit [`.env`](.env) to set the Pi hostname and the user that should autologin on boot.
+Then add a line like this, replacing the repo path with your own values:
+
+```cron
+@reboot sleep 10 && DISPLAY=:0 /usr/bin/python3 /home/YOUR_USER/TacomaDashboard/dashboard.py >> /home/YOUR_USER/TacomaDashboard/dashboard.log 2>&1```
+
+Because this line lives in root's crontab, the dashboard runs as root. The current dashboard is still a Tkinter app, so it will still need a desktop session available to display on the touchscreen.
 
 ## Running Manually
 
 If you want to launch it yourself instead of using the boot flow:
 
 ```bash
-source .venv/bin/activate
-python dashboard.py
+python3 dashboard.py
 ```
 
 Controls in the dashboard:
@@ -82,16 +85,57 @@ Controls in the dashboard:
 
 ## Raspberry Pi OS Notes
 
-For the cleanest desktop startup, make sure the standard Raspberry Pi OS desktop is set to autologin for the user in [`.env`](.env).
+For the cleanest startup, make sure the standard Raspberry Pi OS desktop is set to autologin for the user that will run the dashboard.
 
 For screen tuning, you can optionally set display values in `/boot/config.txt` such as `disable_overscan=1` and the correct HDMI mode for your panel.
 
-The setup script also applies boot quieting with `quiet splash loglevel=0 logo.nologo vt.global_cursor_default=0`, `disable_splash=1`, and `boot_delay=0`.
+Boot time can usually be improved further with these options:
 
-If you are not using Bluetooth OBD or mDNS discovery, set `PI_DISABLE_UNUSED_SERVICES=1` in [`.env`](.env) before running the installer to disable `bluetooth`, `hciuart`, and `avahi-daemon`.
+1. Disable unused services:
+
+```bash
+sudo systemctl disable bluetooth
+sudo systemctl disable hciuart
+sudo systemctl disable avahi-daemon
+sudo systemctl disable triggerhappy
+```
+
+2. If this Pi is only driving the touchscreen and not doing heavy graphics work, reduce GPU memory in `/boot/firmware/config.txt` or `/boot/config.txt`:
+
+```text
+gpu_mem=64
+```
+
+3. Keep the splash screen disabled and the kernel output quiet. In `/boot/firmware/config.txt` or `/boot/config.txt`:
+
+```text
+disable_splash=1
+boot_delay=0
+```
+
+And in `/boot/firmware/cmdline.txt` or `/boot/cmdline.txt`, keep the options on the same line as the existing boot arguments:
+
+```text
+quiet splash loglevel=0 logo.nologo vt.global_cursor_default=0
+```
+
+4. Make sure LightDM autologin is enabled so the login screen does not add delay:
+
+```ini
+[Seat:*]
+autologin-user=YOUR_USER
+autologin-user-timeout=0
+```
+
+5. If the dashboard does not need to wait as long on startup, shorten the sleep in the crontab entry gradually. Start with `sleep 10`, then try `sleep 5` if the dashboard still launches reliably.
+
+```cron
+@reboot sleep 10 && DISPLAY=:0 /usr/bin/python3 /home/YOUR_USER/TacomaDashboard/dashboard.py >> /home/YOUR_USER/TacomaDashboard/dashboard.log 2>&1
+```
+
+6. A faster SD card or a USB SSD can make a big difference on a Pi. An A1/A2-rated card is a good minimum, and SSD storage is usually the best upgrade if the hardware supports it.
 
 ## Files
 
 - `dashboard.py` - main dashboard application.
-- `requirements.txt` - Python package list for the virtual environment.
-- `setup_raspberry_pi.sh` - dependency install and startup setup script.
+- `requirements.txt` - Python package list for the system install.
