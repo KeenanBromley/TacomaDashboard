@@ -52,7 +52,9 @@ FUEL_SAVE_INTERVAL = 30
 MPG_HISTORY_MAX = 300
 # EWMA smoothing factor for average MPG (alpha)
 # Higher alpha -> more responsive, lower alpha -> smoother long-term average
-EWMA_ALPHA = 0.05
+EWMA_ALPHA = 0.02
+# EWMA smoothing factor for the displayed distance-to-empty value
+DTE_EWMA_ALPHA = 0.05
 
 # ---------------------------------------------------------------------------
 # Color palettes
@@ -135,8 +137,10 @@ class OBDDashboard:
 
         # ── Fuel tracking (loaded from disk on startup) ───────────────────
         self.gas_used_gallons  = 0.0   # cumulative gallons consumed
+        self.total_distance_mi = 0.0   # cumulative miles driven on the current tank
         self.saved_avg_mpg     = 0.0   # last saved avg mpg from disk
         self.ewma_mpg          = None  # exponentially-weighted moving average state
+        self.ewma_dte          = None  # smoothed distance-to-empty display state
         self.last_fuel_save    = time.time()
 
         self._load_fuel_state()
@@ -197,6 +201,7 @@ class OBDDashboard:
             with open(FUEL_STATE_FILE, 'r') as fh:
                 data = json.load(fh)
             self.gas_used_gallons = float(data.get('gas_used_gallons', 0.0))
+            self.total_distance_mi = float(data.get('total_distance_mi', 0.0))
             # load last saved average MPG if present and seed EWMA
             self.saved_avg_mpg = float(data.get('avg_mpg', 0.0))
             if self.saved_avg_mpg > 0:
@@ -218,6 +223,7 @@ class OBDDashboard:
         try:
             data = {
                 'gas_used_gallons':  self.gas_used_gallons,
+                'total_distance_mi':  self.total_distance_mi,
                 # persist the most recent average MPG so DTE is available after reboot
                 'avg_mpg':           float(self.vehicle_data.get('avg_mpg', 0.0)),
                 'saved_at':          datetime.now().isoformat(),
@@ -233,6 +239,8 @@ class OBDDashboard:
     def _fill_tank(self):
         """Reset fuel consumption to zero (full tank) and persist immediately."""
         self.gas_used_gallons = 0.0
+        self.total_distance_mi = 0.0
+        self.ewma_dte = None
         self._save_fuel_state()
         print("Tank reset to full.")
 
@@ -246,11 +254,18 @@ class OBDDashboard:
 
     @property
     def _distance_to_empty_mi(self) -> float:
-        """Estimated miles remaining based on current average MPG."""
-        avg_mpg = self.vehicle_data.get('avg_mpg', 0.0)
-        if avg_mpg <= 0:
-            return 0.0
-        return self._gallons_remaining * avg_mpg
+        """Estimated miles remaining based on lifetime MPG for the current tank."""
+        if self.gas_used_gallons <= 0:
+            return self._gallons_remaining * 15.0
+
+        lifetime_mpg = self.total_distance_mi / self.gas_used_gallons
+        return self._gallons_remaining * lifetime_mpg
+
+    @property
+    def _smoothed_dte(self) -> float:
+        if self.ewma_dte is not None:
+            return max(0.0, self.ewma_dte)
+        return self._distance_to_empty_mi
 
     @property
     def _fuel_percent(self) -> float:
@@ -632,6 +647,7 @@ class OBDDashboard:
         """Clear the MPG history and saved average MPG without touching trip distance."""
         self.mpg_history.clear()
         self.ewma_mpg = None
+        self.ewma_dte = None
         self.saved_avg_mpg = 0.0
         self.vehicle_data['instant_mpg'] = 0.0
         self.vehicle_data['avg_mpg'] = 0.0
@@ -688,8 +704,10 @@ class OBDDashboard:
             raw_mph = speed_resp.value.to('mph').magnitude
             self.vehicle_data['speed'] = raw_mph * TIRE_CORRECTION_FACTOR
 
+        current_rpm = 0.0
         if not rpm_resp.is_null():
-            self.vehicle_data['rpm'] = rpm_resp.value.magnitude
+            current_rpm = rpm_resp.value.magnitude
+        self.vehicle_data['rpm'] = current_rpm
 
         if not coolant_resp.is_null():
             self.vehicle_data['coolant_temp'] = coolant_resp.value.to('degF').magnitude
@@ -706,15 +724,16 @@ class OBDDashboard:
         speed      = self.vehicle_data['speed']
 
         if speed > 0 and elapsed_hr > 0:
-            self.trip_distance_mi += speed * elapsed_hr
+            delta = speed * elapsed_hr
+            self.trip_distance_mi += delta
+            self.total_distance_mi += delta
 
         self.last_obd_time = now
 
         # ── MPG + fuel consumption ────────────────────────────────────────
         # Only compute MPG when the engine is actually running.
         # This prevents accessory-power-only readings from dragging avg MPG and DTE down.
-        rpm = self.vehicle_data['rpm']
-        if rpm > 0 and not maf_resp.is_null():
+        if current_rpm > 0 and not maf_resp.is_null():
             maf_g_per_s = maf_resp.value.magnitude   # grams/second
 
             if maf_g_per_s > 0:
@@ -731,10 +750,10 @@ class OBDDashboard:
                 lb_per_hr  = maf_g_per_s * 0.002205 * 3600
                 gal_per_hr = lb_per_hr / 6.17
                 self.gas_used_gallons += gal_per_hr * elapsed_hr
-        elif rpm <= 0:
-            # Engine off / accessory power only: keep the display honest,
-            # but do not let zero MPG samples affect averages or range.
-            self.vehicle_data['instant_mpg'] = 0.0
+            else:
+                # Engine off / accessory power only: keep the display honest,
+                # but do not let the last driving sample continue to update MPG.
+                self.vehicle_data['instant_mpg'] = 0.0
 
         # Trim mpg_history to a reasonable maximum to avoid unbounded growth
         while len(self.mpg_history) > MPG_HISTORY_MAX:
@@ -743,10 +762,9 @@ class OBDDashboard:
             except IndexError:
                 break
 
-        # Update EWMA with the most recent instantaneous sample (if any)
-        # Prefer the last appended mpg sample if present
-        last_sample = self.mpg_history[-1] if len(self.mpg_history) > 0 else None
-        if last_sample is not None:
+        # Update MPG only while the engine is running.
+        if current_rpm > 0 and len(self.mpg_history) > 0:
+            last_sample = self.mpg_history[-1]
             if self.ewma_mpg is None:
                 # initialize EWMA state with first sample
                 self.ewma_mpg = float(last_sample)
@@ -754,13 +772,23 @@ class OBDDashboard:
                 # EWMA update: new = alpha*sample + (1-alpha)*old
                 self.ewma_mpg = (EWMA_ALPHA * float(last_sample)) + ((1 - EWMA_ALPHA) * self.ewma_mpg)
 
-        # Determine average MPG to display: use EWMA, else saved value, else safe default
-        if self.ewma_mpg is not None and self.ewma_mpg > 0:
-            self.vehicle_data['avg_mpg'] = float(self.ewma_mpg)
-        elif self.saved_avg_mpg > 0:
-            self.vehicle_data['avg_mpg'] = float(self.saved_avg_mpg)
-        else:
-            self.vehicle_data['avg_mpg'] = 15.0
+            # Determine average MPG to display: use EWMA, else saved value, else safe default
+            if self.ewma_mpg is not None and self.ewma_mpg > 0:
+                self.vehicle_data['avg_mpg'] = float(self.ewma_mpg)
+            elif self.saved_avg_mpg > 0:
+                self.vehicle_data['avg_mpg'] = float(self.saved_avg_mpg)
+            else:
+                self.vehicle_data['avg_mpg'] = 15.0
+
+        raw_dte = self._distance_to_empty_mi
+        if raw_dte > 0:
+            if self.ewma_dte is None:
+                self.ewma_dte = raw_dte
+            else:
+                self.ewma_dte = (
+                    DTE_EWMA_ALPHA * raw_dte
+                    + (1 - DTE_EWMA_ALPHA) * self.ewma_dte
+                )
 
     # -----------------------------------------------------------------------
     # Display update (called on main thread)
@@ -788,7 +816,7 @@ class OBDDashboard:
         self.intake_frame.value_label.config(text=f"{int(d['intake_temp'])}")
 
         # Distance-to-empty gauge with colour coding
-        dte = self._distance_to_empty_mi
+        dte = self._smoothed_dte
         dte_color = self._dte_color(dte)
         self.dte_frame.value_label.config(
             text=f"{int(dte)}",
@@ -816,7 +844,7 @@ class OBDDashboard:
             self.trip_avg_mpg_frame.value_label.config(text=f"{avg_mpg:.1f} mpg")
 
         # Distance-to-empty card
-        dte       = self._distance_to_empty_mi
+        dte       = self._smoothed_dte
         gal_left  = self._gallons_remaining
         dte_color = self._dte_color(dte)
 
