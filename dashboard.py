@@ -392,7 +392,7 @@ class OBDDashboard:
 
         tk.Button(
             btn_row,
-            text="⛽ FILL TANK",
+            text="FILL TANK",
             command=self._fill_tank_and_refresh,
             font=tkfont.Font(size=18, weight='bold'),
             bg=colors['button_bg'],
@@ -402,6 +402,24 @@ class OBDDashboard:
             bd=3,
             height=3,
             width=14,
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Secondary action row for MPG reset
+        btn_row2 = tk.Frame(outer, bg=colors['bg'])
+        btn_row2.pack(pady=(8, 0))
+
+        tk.Button(
+            btn_row2,
+            text="RESET AVG MPG",
+            command=self._reset_avg_mpg,
+            font=tkfont.Font(size=18, weight='bold'),
+            bg=colors['button_bg'],
+            fg=colors['text'],
+            activebackground=colors['warning'],
+            relief=tk.RAISED,
+            bd=3,
+            height=3,
+            width=18,
         ).pack(side=tk.LEFT, padx=5)
 
     def _make_dte_card(self, parent: tk.Frame, colors: dict) -> tk.Frame:
@@ -610,6 +628,19 @@ class OBDDashboard:
         self._fill_tank()
         self._rebuild_ui()
 
+    def _reset_avg_mpg(self):
+        """Clear the MPG history and saved average MPG without touching trip distance."""
+        self.mpg_history.clear()
+        self.ewma_mpg = None
+        self.saved_avg_mpg = 0.0
+        self.vehicle_data['instant_mpg'] = 0.0
+        self.vehicle_data['avg_mpg'] = 0.0
+        self._save_fuel_state()
+        # Keep the UI readable by falling back to the default MPG value until driving resumes.
+        self.vehicle_data['avg_mpg'] = 15.0
+        self._rebuild_ui()
+        print("Average MPG reset.")
+
     def _rebuild_ui(self):
         """Destroy and recreate all widgets (used after mode/view changes)."""
         for widget in self.root.winfo_children():
@@ -680,11 +711,10 @@ class OBDDashboard:
         self.last_obd_time = now
 
         # ── MPG + fuel consumption ────────────────────────────────────────
-        # Behavior changes requested:
-        # - If speed == 0 -> instant_mpg = 0 and append 0 to history
-        # - If avg_mpg for trip is 0, fall back to saved avg_mpg from disk
-        # - If saved avg_mpg is also 0, default to 15 mpg
-        if not maf_resp.is_null() and speed > 0:
+        # Only compute MPG when the engine is actually running.
+        # This prevents accessory-power-only readings from dragging avg MPG and DTE down.
+        rpm = self.vehicle_data['rpm']
+        if rpm > 0 and not maf_resp.is_null():
             maf_g_per_s = maf_resp.value.magnitude   # grams/second
 
             if maf_g_per_s > 0:
@@ -701,12 +731,10 @@ class OBDDashboard:
                 lb_per_hr  = maf_g_per_s * 0.002205 * 3600
                 gal_per_hr = lb_per_hr / 6.17
                 self.gas_used_gallons += gal_per_hr * elapsed_hr
-        else:
-            # No valid MAF reading or not moving.
-            if speed == 0:
-                # When stationary, set instant MPG to 0 and include that in history
-                self.vehicle_data['instant_mpg'] = 0.0
-                self.mpg_history.append(0.0)
+        elif rpm <= 0:
+            # Engine off / accessory power only: keep the display honest,
+            # but do not let zero MPG samples affect averages or range.
+            self.vehicle_data['instant_mpg'] = 0.0
 
         # Trim mpg_history to a reasonable maximum to avoid unbounded growth
         while len(self.mpg_history) > MPG_HISTORY_MAX:
