@@ -20,7 +20,6 @@ import threading
 import time
 import json
 import os
-from collections import deque
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -48,11 +47,9 @@ FUEL_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fuel
 
 # How often (seconds) to write the fuel state to disk
 FUEL_SAVE_INTERVAL = 30
-# Maximum stored MPG history length to avoid unbounded memory growth
-MPG_HISTORY_MAX = 300
-# EWMA smoothing factor for average MPG (alpha)
-# Higher alpha -> more responsive, lower alpha -> smoother long-term average
-EWMA_ALPHA = 0.02
+# If the tank was used beyond this threshold before filling, the current tank
+# replaces the previous tank. Smaller top-offs are accumulated into the previous tank.
+TANK_COPY_THRESHOLD = 0.75
 # EWMA smoothing factor for the displayed distance-to-empty value
 DTE_EWMA_ALPHA = 0.05
 
@@ -126,8 +123,9 @@ class OBDDashboard:
             'avg_mpg':      0.0,
         }
 
-        # ── MPG history (all readings in current trip) ────────────────────
-        self.mpg_history: deque[float] = deque()
+        # ── Tank fuel state ────────────────────────────────────────────────
+        self.current_tank = self._new_tank_state()
+        self.previous_tank = self._new_tank_state()
 
         # ── Trip statistics ───────────────────────────────────────────────
         self.trip_start_time  = datetime.now()
@@ -136,12 +134,8 @@ class OBDDashboard:
         self.last_obd_time    = time.time()
 
         # ── Fuel tracking (loaded from disk on startup) ───────────────────
-        self.gas_used_gallons  = 0.0   # cumulative gallons consumed
-        self.total_distance_mi = 0.0   # cumulative miles driven on the current tank
-        self.saved_avg_mpg     = 0.0   # last saved avg mpg from disk
-        self.ewma_mpg          = None  # exponentially-weighted moving average state
-        self.ewma_dte          = None  # smoothed distance-to-empty display state
-        self.last_fuel_save    = time.time()
+        self.ewma_dte       = None  # smoothed distance-to-empty display state
+        self.last_fuel_save = time.time()
 
         self._load_fuel_state()
 
@@ -192,6 +186,68 @@ class OBDDashboard:
     # Fuel state persistence
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _new_tank_state() -> dict:
+        return {
+            'mpg_sum_centi': 0,
+            'mpg_count': 0,
+            'gas_used_gallons': 0.0,
+        }
+
+    def _load_tank_state(self, tank_data: dict | None) -> dict:
+        tank = self._new_tank_state()
+        if isinstance(tank_data, dict):
+            tank['mpg_sum_centi'] = int(tank_data.get('mpg_sum_centi', tank_data.get('mpg_sum', 0)))
+            tank['mpg_count'] = int(tank_data.get('mpg_count', 0))
+            tank['gas_used_gallons'] = float(tank_data.get('gas_used_gallons', 0.0))
+        return tank
+
+    def _merge_tank_state(self, target: dict, source: dict):
+        target['mpg_sum_centi'] += int(source.get('mpg_sum_centi', 0))
+        target['mpg_count'] += int(source.get('mpg_count', 0))
+        target['gas_used_gallons'] += float(source.get('gas_used_gallons', 0.0))
+
+    def _copy_tank_state(self, source: dict) -> dict:
+        return {
+            'mpg_sum_centi': int(source.get('mpg_sum_centi', 0)),
+            'mpg_count': int(source.get('mpg_count', 0)),
+            'gas_used_gallons': float(source.get('gas_used_gallons', 0.0)),
+        }
+
+    @property
+    def _current_gas_used_gallons(self) -> float:
+        return max(0.0, float(self.current_tank['gas_used_gallons']))
+
+    @property
+    def _gallons_remaining(self) -> float:
+        return max(0.0, TANK_CAPACITY_GALLONS - self._current_gas_used_gallons)
+
+    @property
+    def _current_tank_usage_fraction(self) -> float:
+        if TANK_CAPACITY_GALLONS <= 0:
+            return 0.0
+        return min(1.0, self._current_gas_used_gallons / TANK_CAPACITY_GALLONS)
+
+    @property
+    def _combined_mpg_sum_centi(self) -> int:
+        return int(self.previous_tank['mpg_sum_centi']) + int(self.current_tank['mpg_sum_centi'])
+
+    @property
+    def _combined_mpg_count(self) -> int:
+        return int(self.previous_tank['mpg_count']) + int(self.current_tank['mpg_count'])
+
+    @property
+    def _combined_avg_mpg(self) -> float:
+        count = self._combined_mpg_count
+        if count <= 0:
+            return 0.0
+        return (self._combined_mpg_sum_centi / count) / 100.0
+
+    @property
+    def _display_avg_mpg(self) -> float:
+        avg_mpg = self._combined_avg_mpg
+        return avg_mpg if avg_mpg > 0 else 15.0
+
     def _load_fuel_state(self):
         """
         Read saved fuel state from disk on startup.
@@ -200,19 +256,32 @@ class OBDDashboard:
         try:
             with open(FUEL_STATE_FILE, 'r') as fh:
                 data = json.load(fh)
-            self.gas_used_gallons = float(data.get('gas_used_gallons', 0.0))
-            self.total_distance_mi = float(data.get('total_distance_mi', 0.0))
-            # load last saved average MPG if present and seed EWMA
-            self.saved_avg_mpg = float(data.get('avg_mpg', 0.0))
-            if self.saved_avg_mpg > 0:
-                # seed EWMA state and vehicle_data so DTE is available immediately
-                self.ewma_mpg = self.saved_avg_mpg
-                self.vehicle_data['avg_mpg'] = self.saved_avg_mpg
+
+            if 'current_tank' in data or 'previous_tank' in data:
+                self.current_tank = self._load_tank_state(data.get('current_tank'))
+                self.previous_tank = self._load_tank_state(data.get('previous_tank'))
+            else:
+                # Best-effort migration from the older single-tank file.
+                legacy_gas_used = float(data.get('gas_used_gallons', 0.0))
+                legacy_avg_mpg = float(data.get('avg_mpg', 0.0))
+
+                if legacy_avg_mpg <= 0 and legacy_gas_used > 0:
+                    legacy_distance = float(data.get('total_distance_mi', 0.0))
+                    if legacy_distance > 0:
+                        legacy_avg_mpg = legacy_distance / legacy_gas_used
+
+                self.current_tank = self._new_tank_state()
+                self.previous_tank = self._new_tank_state()
+                self.current_tank['gas_used_gallons'] = legacy_gas_used
+                if legacy_avg_mpg > 0 and legacy_gas_used > 0:
+                    self.current_tank['mpg_sum_centi'] = int(round(legacy_avg_mpg * 100))
+                    self.current_tank['mpg_count'] = 1
 
             print(
-                f"Loaded fuel state: {self.gas_used_gallons:.3f} gal used "
-                f"({self._gallons_remaining:.2f} gal remaining), avg_mpg={self.saved_avg_mpg:.1f}."
+                f"Loaded fuel state: {self._current_gas_used_gallons:.3f} gal used "
+                f"({self._gallons_remaining:.2f} gal remaining), avg_mpg={self._combined_avg_mpg:.1f}."
             )
+            self.vehicle_data['avg_mpg'] = self._display_avg_mpg
         except FileNotFoundError:
             print("No fuel state file found — assuming a full tank.")
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
@@ -222,11 +291,9 @@ class OBDDashboard:
         """Write current fuel state to disk (called every FUEL_SAVE_INTERVAL seconds)."""
         try:
             data = {
-                'gas_used_gallons':  self.gas_used_gallons,
-                'total_distance_mi':  self.total_distance_mi,
-                # persist the most recent average MPG so DTE is available after reboot
-                'avg_mpg':           float(self.vehicle_data.get('avg_mpg', 0.0)),
-                'saved_at':          datetime.now().isoformat(),
+                'current_tank': self.current_tank,
+                'previous_tank': self.previous_tank,
+                'saved_at': datetime.now().isoformat(),
             }
             # Write atomically via a temp file to avoid corruption on power loss
             tmp_path = FUEL_STATE_FILE + '.tmp'
@@ -238,8 +305,12 @@ class OBDDashboard:
 
     def _fill_tank(self):
         """Reset fuel consumption to zero (full tank) and persist immediately."""
-        self.gas_used_gallons = 0.0
-        self.total_distance_mi = 0.0
+        if self._current_tank_usage_fraction > TANK_COPY_THRESHOLD:
+            self.previous_tank = self._copy_tank_state(self.current_tank)
+        else:
+            self._merge_tank_state(self.previous_tank, self.current_tank)
+
+        self.current_tank = self._new_tank_state()
         self.ewma_dte = None
         self._save_fuel_state()
         print("Tank reset to full.")
@@ -249,17 +320,12 @@ class OBDDashboard:
     # -----------------------------------------------------------------------
 
     @property
-    def _gallons_remaining(self) -> float:
-        return max(0.0, TANK_CAPACITY_GALLONS - self.gas_used_gallons)
-
-    @property
     def _distance_to_empty_mi(self) -> float:
-        """Estimated miles remaining based on lifetime MPG for the current tank."""
-        if self.gas_used_gallons <= 0:
-            return self._gallons_remaining * 15.0
-
-        lifetime_mpg = self.total_distance_mi / self.gas_used_gallons
-        return self._gallons_remaining * lifetime_mpg
+        """Estimated miles remaining based on the combined average MPG."""
+        avg_mpg = self._combined_avg_mpg
+        if avg_mpg <= 0:
+            avg_mpg = 15.0
+        return self._gallons_remaining * avg_mpg
 
     @property
     def _smoothed_dte(self) -> float:
@@ -632,10 +698,9 @@ class OBDDashboard:
         self._rebuild_ui()
 
     def _reset_trip(self):
-        """Clear trip timer, distance, and MPG history."""
+        """Clear trip timer and trip distance."""
         self.trip_start_time  = datetime.now()
         self.trip_distance_mi = 0.0
-        self.mpg_history.clear()
         print("Trip statistics reset.")
 
     def _fill_tank_and_refresh(self):
@@ -644,11 +709,12 @@ class OBDDashboard:
         self._rebuild_ui()
 
     def _reset_avg_mpg(self):
-        """Clear the MPG history and saved average MPG without touching trip distance."""
-        self.mpg_history.clear()
-        self.ewma_mpg = None
+        """Clear the MPG aggregates without touching trip distance or fuel used."""
+        self.current_tank['mpg_sum_centi'] = 0
+        self.current_tank['mpg_count'] = 0
+        self.previous_tank['mpg_sum_centi'] = 0
+        self.previous_tank['mpg_count'] = 0
         self.ewma_dte = None
-        self.saved_avg_mpg = 0.0
         self.vehicle_data['instant_mpg'] = 0.0
         self.vehicle_data['avg_mpg'] = 0.0
         self._save_fuel_state()
@@ -726,7 +792,6 @@ class OBDDashboard:
         if speed > 0 and elapsed_hr > 0:
             delta = speed * elapsed_hr
             self.trip_distance_mi += delta
-            self.total_distance_mi += delta
 
         self.last_obd_time = now
 
@@ -742,43 +807,23 @@ class OBDDashboard:
                 instant_mpg = (speed * 7.107) / maf_g_per_s
                 instant_mpg = min(instant_mpg, 99.9)
                 self.vehicle_data['instant_mpg'] = instant_mpg
-                self.mpg_history.append(instant_mpg)
+
+                mpg_sample_centi = int(round(instant_mpg * 100))
+                self.current_tank['mpg_sum_centi'] += mpg_sample_centi
+                self.current_tank['mpg_count'] += 1
 
                 # Fuel consumed this interval:
                 #   MAF (g/s) → lb/hr → gal/hr (gasoline ≈ 6.17 lb/gal)
                 #   gal/hr × elapsed_hr = gallons used
                 lb_per_hr  = maf_g_per_s * 0.002205 * 3600
                 gal_per_hr = lb_per_hr / 6.17
-                self.gas_used_gallons += gal_per_hr * elapsed_hr
+                self.current_tank['gas_used_gallons'] += gal_per_hr * elapsed_hr
             else:
                 # Engine off / accessory power only: keep the display honest,
                 # but do not let the last driving sample continue to update MPG.
                 self.vehicle_data['instant_mpg'] = 0.0
 
-        # Trim mpg_history to a reasonable maximum to avoid unbounded growth
-        while len(self.mpg_history) > MPG_HISTORY_MAX:
-            try:
-                self.mpg_history.popleft()
-            except IndexError:
-                break
-
-        # Update MPG only while the engine is running.
-        if current_rpm > 0 and len(self.mpg_history) > 0:
-            last_sample = self.mpg_history[-1]
-            if self.ewma_mpg is None:
-                # initialize EWMA state with first sample
-                self.ewma_mpg = float(last_sample)
-            else:
-                # EWMA update: new = alpha*sample + (1-alpha)*old
-                self.ewma_mpg = (EWMA_ALPHA * float(last_sample)) + ((1 - EWMA_ALPHA) * self.ewma_mpg)
-
-            # Determine average MPG to display: use EWMA, else saved value, else safe default
-            if self.ewma_mpg is not None and self.ewma_mpg > 0:
-                self.vehicle_data['avg_mpg'] = float(self.ewma_mpg)
-            elif self.saved_avg_mpg > 0:
-                self.vehicle_data['avg_mpg'] = float(self.saved_avg_mpg)
-            else:
-                self.vehicle_data['avg_mpg'] = 15.0
+        self.vehicle_data['avg_mpg'] = self._display_avg_mpg
 
         raw_dte = self._distance_to_empty_mi
         if raw_dte > 0:
